@@ -1,43 +1,58 @@
-"""Shared plugin catalog and validated, atomic preferences."""
-from dataclasses import dataclass
+"""Versioned preferences with validation, migration and atomic persistence."""
+from copy import deepcopy
 import json
 from pathlib import Path
 import os
 import tempfile
 
-
-@dataclass(frozen=True)
-class Plugin:
-    id: str
-    title: str
-    description: str
-    category: str
+from .catalog import CATALOG, PLUGINS, DEFAULT_INSTALLED, DEFAULT_PANELS
 
 
-PLUGINS = (
-    Plugin("system", "系统状态", "实时 CPU、内存、系统盘和网络速率", "监控"),
-    Plugin("processes", "进程查看", "查看进程内存占用与 PID", "监控"),
-    Plugin("network", "网络信息", "网卡状态、本机 IP 与连接速率", "监控"),
-    Plugin("awake", "防止休眠", "保持系统唤醒，可同时保持屏幕常亮", "电源"),
-    Plugin("shortcuts", "快捷操作", "快速打开 Windows 设置和系统管理工具", "系统"),
-)
+def string_list(value):
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError("Expected a list of strings")
+    return list(dict.fromkeys(value))
 
 
 class Preferences:
     def __init__(self, path: Path):
         self.path = path
         self.warning = ""
-        self.disabled: set[str] = set()
+        self.installed = set(DEFAULT_INSTALLED)
+        self.disabled = set()
         self.close_to_tray = True
+        self.panels = deepcopy(DEFAULT_PANELS)
+        self.sidebar_order = list(CATALOG)
+        self.collapsed = set()
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            disabled = data.get("disabled", [])
-            if not isinstance(disabled, list) or not all(isinstance(x, str) for x in disabled):
-                raise ValueError("Invalid plugin list")
-            if not isinstance(data.get("close_to_tray", True), bool):
+            if not isinstance(data, dict) or data.get("version", 1) not in (1, 2):
+                raise ValueError("Unsupported preferences")
+            installed = set(string_list(data.get("installed", list(DEFAULT_INSTALLED)))) & CATALOG.keys()
+            disabled = set(string_list(data.get("disabled", []))) & installed
+            close = data.get("close_to_tray", True)
+            if not isinstance(close, bool):
                 raise ValueError("Invalid tray preference")
-            self.disabled = set(disabled) & {p.id for p in PLUGINS}
-            self.close_to_tray = data.get("close_to_tray", True)
+            panels = data.get("panels", deepcopy(DEFAULT_PANELS))
+            if not isinstance(panels, list) or not 1 <= len(panels) <= 20:
+                raise ValueError("Invalid panels")
+            normalized = []
+            seen = set()
+            for panel in panels:
+                if not isinstance(panel, dict):
+                    raise ValueError("Invalid panel")
+                key, title = panel.get("id"), panel.get("title")
+                if not isinstance(key, str) or not key or key in seen or not isinstance(title, str) or not title.strip():
+                    raise ValueError("Invalid panel identity")
+                seen.add(key)
+                normalized.append({"id": key, "title": title[:40],
+                                   "items": [p for p in string_list(panel.get("items", [])) if p in installed]})
+            order = [p for p in string_list(data.get("sidebar_order", list(CATALOG))) if p in CATALOG]
+            collapsed = set(string_list(data.get("collapsed", []))) & {"app", "custom", "plugins"}
+            self.installed, self.disabled, self.close_to_tray = installed, disabled, close
+            self.panels = normalized
+            self.sidebar_order = order + [p for p in CATALOG if p not in order]
+            self.collapsed = collapsed
         except FileNotFoundError:
             pass
         except (OSError, ValueError, TypeError, AttributeError):
@@ -48,8 +63,10 @@ class Preferences:
         fd, name = tempfile.mkstemp(dir=self.path.parent, suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump({"version": 1, "disabled": sorted(self.disabled),
-                           "close_to_tray": self.close_to_tray}, stream, ensure_ascii=False, indent=2)
+                json.dump({"version": 2, "installed": sorted(self.installed),
+                           "disabled": sorted(self.disabled), "close_to_tray": self.close_to_tray,
+                           "panels": self.panels, "sidebar_order": self.sidebar_order,
+                           "collapsed": sorted(self.collapsed)}, stream, ensure_ascii=False, indent=2)
             os.replace(name, self.path)
         finally:
             if os.path.exists(name):

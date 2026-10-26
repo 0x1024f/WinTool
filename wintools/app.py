@@ -1,422 +1,669 @@
-"""Qt desktop host, tray, built-in panels and searchable actions."""
+"""Plugin-first settings shell, component library and customizable panels."""
 import argparse
-import os
 from pathlib import Path
-import platform
 import sys
+from tempfile import TemporaryDirectory
 
-from PySide6.QtCore import Qt, QTimer, QStandardPaths
-from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
+from PySide6.QtCore import Qt, QSize, QTimer, QStandardPaths
+from PySide6.QtGui import QKeySequence, QShortcut, QColor
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QDialog, QFrame, QGridLayout, QHBoxLayout,
-    QHeaderView, QLabel, QLineEdit, QListWidget, QMainWindow, QMenu,
-    QMessageBox, QPushButton, QProgressBar, QStackedWidget, QSystemTrayIcon,
-    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QTreeWidget, QTreeWidgetItem, QLineEdit, QScrollArea, QComboBox, QCheckBox,
+    QDialog, QListWidget, QListWidgetItem, QAbstractItemView, QMessageBox,
+    QInputDialog, QMenu, QSystemTrayIcon, QSplitter, QLayout,
 )
-
-from .core import PLUGINS, Preferences, format_bytes
+from .catalog import CATALOG, PLUGINS
+from .core import Preferences
+from .host import PluginHost
 from .monitor import Monitor
 from .windows import WindowsSystem
+from .ui import STYLE, label, button, card, icon, plugin_heading, clear_layout, Toggle, dark_palette
 
 
-ACTIONS = (
-    ("display", "显示设置", "分辨率 · 缩放 · 多显示器"),
-    ("sound", "声音设置", "输出设备 · 麦克风 · 音量"),
-    ("network", "网络设置", "Wi-Fi · 以太网 · 代理"),
-    ("startup", "启动应用", "管理开机启动项目"),
-    ("storage", "存储管理", "磁盘空间 · 临时文件"),
-    ("apps", "应用管理", "查看和卸载已安装应用"),
-    ("power", "电源设置", "屏幕关闭 · 睡眠时间"),
-    ("update", "Windows 更新", "查看更新与系统版本"),
-    ("taskmgr", "任务管理器", "进程 · 性能 · 服务"),
-    ("lock", "锁定电脑", "立即返回 Windows 锁屏"),
-)
+class Services:
+    def __init__(self, window):
+        self.window = window
+        self.system = WindowsSystem()
 
-STYLE = """
-QWidget { font-family: 'Segoe UI', 'Microsoft YaHei UI'; font-size: 14px; color: #dce4f2; }
-QMainWindow, QDialog { background: #10151e; }
-QWidget#sidebar { background: #151c28; border-right: 1px solid #293345; }
-QLabel#brand { font-size: 25px; font-weight: 700; color: #f4f7ff; }
-QLabel#title { font-size: 28px; font-weight: 700; }
-QLabel#muted { color: #92a1b7; }
-QLabel#metric { font-size: 30px; font-weight: 600; color: #f2f6ff; }
-QFrame#card { background: #1b2432; border: 1px solid #2b374a; border-radius: 12px; }
-QPushButton { background: #243249; border: 1px solid #34445e; border-radius: 7px; padding: 10px 14px; text-align: left; }
-QPushButton:hover { background: #304360; border-color: #6d9df7; }
-QPushButton:checked { background: #29456d; color: #afceff; border-color: #5287d4; }
-QPushButton:disabled { color: #647083; background: #1a2130; }
-QLineEdit { background: #192230; border: 1px solid #34445e; border-radius: 7px; padding: 11px; }
-QLineEdit:focus { border-color: #74a8ff; }
-QProgressBar { background: #303e52; border: none; border-radius: 3px; max-height: 6px; }
-QProgressBar::chunk { background: #75a5ff; border-radius: 3px; }
-QTableWidget, QListWidget { background: #18212e; alternate-background-color: #1c2736; border: 1px solid #2b374a; border-radius: 6px; gridline-color: #293447; }
-QHeaderView::section { background: #223047; padding: 10px; border: none; text-align: left; }
-QTableWidget::item, QListWidget::item { padding: 8px; }
-QListWidget::item:selected { background: #345581; }
-QCheckBox { spacing: 10px; padding: 8px 0; }
-QCheckBox::indicator { width: 18px; height: 18px; }
-QMenu { background: #1b2432; border: 1px solid #34445e; }
-QMenu::item { padding: 8px 24px; }
-QMenu::item:selected { background: #345581; }
-QStatusBar { color: #92a1b7; background: #151c28; }
-"""
+    def notify(self, message):
+        self.window.statusBar().showMessage(message, 6000)
 
+    def error(self, message):
+        QMessageBox.warning(self.window, "操作未完成", message)
 
-def label(text, role=None):
-    item = QLabel(text)
-    if role:
-        item.setObjectName(role)
-    item.setWordWrap(True)
-    return item
+    def confirm(self, title, message):
+        return QMessageBox.question(self.window, title, message) == QMessageBox.StandardButton.Yes
 
-
-def icon():
-    image = QPixmap(64, 64)
-    image.fill(Qt.GlobalColor.transparent)
-    painter = QPainter(image)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    painter.setBrush(QColor("#649bff"))
-    painter.setPen(Qt.PenStyle.NoPen)
-    painter.drawRoundedRect(2, 2, 60, 60, 15, 15)
-    painter.setPen(QColor("#10151e"))
-    font = painter.font()
-    font.setPixelSize(36)
-    font.setBold(True)
-    painter.setFont(font)
-    painter.drawText(image.rect(), Qt.AlignmentFlag.AlignCenter, "W")
-    painter.end()
-    return QIcon(image)
+    def run(self, action_id):
+        self.window.attempt(lambda: self.window.host.execute(action_id))
 
 
 class Window(QMainWindow):
     def __init__(self, prefs, smoke=False):
         super().__init__()
-        self.prefs = prefs
-        self.system = WindowsSystem()
-        self.smoke = smoke
+        self.prefs, self.smoke = prefs, smoke
         self.exiting = False
+        self.closed = False
+        self.destination = "marketplace"
+        self.selected_panel = prefs.panels[0]["id"]
+        self.market_query = ""
+        self.market_category = "全部"
+        self.market_state = "全部状态"
         self.has_snapshot = False
-        self.processes = []
-        self.pages = {}
-        self.nav_buttons = {}
-        self.setWindowTitle("WinTools · Windows 工具箱")
+        self.services = Services(self)
+        self.host = PluginHost(prefs, self.services)
+        self.setWindowTitle("WinTools")
         self.setWindowIcon(icon())
-        self.resize(1120, 760)
-        self.setMinimumSize(920, 650)
-        host = QWidget()
-        self.setCentralWidget(host)
-        root = QHBoxLayout(host)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
+        self.resize(1180, 820)
+        self.setMinimumSize(980, 660)
+        splitter = QSplitter()
+        self.setCentralWidget(splitter)
         sidebar = QWidget()
         sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(212)
-        nav = QVBoxLayout(sidebar)
-        nav.setContentsMargins(20, 28, 20, 22)
-        nav.setSpacing(12)
-        nav.addWidget(label("WinTools", "brand"))
-        nav.addWidget(label("你的 Windows 工具箱", "muted"))
-        nav.addSpacing(28)
-        self.stack = QStackedWidget()
-        root.addWidget(sidebar)
-        root.addWidget(self.stack, 1)
-        for key, title in [(p.id, p.title) for p in PLUGINS] + [("plugins", "插件管理"), ("settings", "偏好设置")]:
-            button = QPushButton(title)
-            button.setCheckable(True)
-            button.clicked.connect(lambda checked=False, k=key: self.navigate(k))
-            nav.addWidget(button)
-            self.nav_buttons[key] = button
-        nav.addStretch()
-        search = QPushButton("搜索操作    Ctrl+K")
-        search.clicked.connect(self.command_palette)
-        nav.addWidget(search)
-        nav.addWidget(label("LOCAL FIRST  /  v0.1", "muted"))
-        self.build_dashboard()
-        self.build_processes()
-        self.build_network()
-        self.build_awake()
-        self.build_actions()
-        self.build_plugins()
-        self.build_settings()
+        sidebar.setMinimumWidth(220)
+        sidebar.setMaximumWidth(330)
+        side = QVBoxLayout(sidebar)
+        side.setContentsMargins(14, 22, 14, 14)
+        side.setSpacing(12)
+        side.addWidget(label("WinTools", "brand"))
+        self.nav_search = QLineEdit()
+        self.nav_search.setPlaceholderText("搜索设置与插件")
+        self.nav_search.textChanged.connect(self.filter_sidebar)
+        side.addWidget(self.nav_search)
+        self.tree = QTreeWidget()
+        self.tree.setHeaderHidden(True)
+        self.tree.setIndentation(12)
+        self.tree.setRootIsDecorated(False)
+        self.tree.setIconSize(QSize(23, 23))
+        self.tree.currentItemChanged.connect(self.sidebar_selected)
+        self.tree.itemClicked.connect(self.sidebar_clicked)
+        self.tree.itemCollapsed.connect(self.remember_groups)
+        self.tree.itemExpanded.connect(self.remember_groups)
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self.sidebar_menu)
+        side.addWidget(self.tree, 1)
+        side.addWidget(button("搜索操作                 Ctrl+K", self.command_palette))
+        self.sidebar_status = label("", "muted")
+        side.addWidget(self.sidebar_status)
+        splitter.addWidget(sidebar)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        splitter.addWidget(self.scroll)
+        splitter.setSizes([248, 932])
+        splitter.setCollapsible(0, False)
+        splitter.setCollapsible(1, False)
         self.tray = QSystemTrayIcon(self.windowIcon(), self)
-        self.tray.setToolTip("WinTools · Windows 工具箱")
-        menu = QMenu(self)
-        menu.addAction("打开 WinTools", self.show_window)
-        menu.addAction("搜索操作", self.command_palette)
-        menu.addSeparator()
-        menu.addAction("退出", self.quit_app)
-        self.tray.setContextMenu(menu)
+        self.tray.setToolTip("WinTools")
         self.tray.activated.connect(self.tray_activated)
+        self.tray_menu = QMenu(self)
+        self.tray.setContextMenu(self.tray_menu)
         if not smoke and QSystemTrayIcon.isSystemTrayAvailable():
             self.tray.show()
         self.shortcut = QShortcut(QKeySequence("Ctrl+K"), self)
         self.shortcut.activated.connect(self.command_palette)
         self.monitor = Monitor(self)
         self.monitor.snapshot.connect(self.update_snapshot)
-        self.monitor.failed.connect(lambda error: self.statusBar().showMessage(f"采样失败：{error}"))
-        self.apply_plugins()
-        self.navigate("system" if "system" not in prefs.disabled else "plugins")
+        self.monitor.failed.connect(lambda message: self.services.notify("采样失败：" + message))
+        self.host.changed.connect(self.host_changed)
+        self.host_changed()
         self.monitor.start()
-        self.statusBar().showMessage(prefs.warning or "本地运行 · 每 2 秒刷新 · Ctrl+K 搜索操作")
+        self.statusBar().showMessage(prefs.warning or "本地插件库 · 按需添加工具，自由组合面板")
 
-    def page(self, key, title, description):
+    def attempt(self, callback):
+        try:
+            return callback()
+        except (OSError, ValueError, KeyError, RuntimeError) as exc:
+            self.services.error(str(exc))
+
+    def host_changed(self):
+        self.monitor.enabled = self.host.active_ids & {"system", "processes", "network"}
+        if self.destination.startswith("plugin:") and self.destination[7:] not in self.host.instances:
+            self.destination = "marketplace"
+        if not any(p["id"] == self.selected_panel for p in self.prefs.panels):
+            self.selected_panel = self.prefs.panels[0]["id"]
+        self.build_sidebar()
+        self.build_tray()
+        self.render()
+
+    def build_sidebar(self):
+        self.tree.blockSignals(True)
+        self.tree.clear()
+        self.nav_items = {}
+        groups = [
+            ("app", "WinTools", [("general", "通用", "⚙", "#a5a5ae"), ("permissions", "权限与隐私", "◇", "#66b6e8"), ("about", "关于", "ⓘ", "#a5a5ae")]),
+            ("custom", "自定义", [("panels", "我的面板", "▦", "#a998f2"), ("marketplace", "插件库", "◈", "#ef66aa"), ("actions", "操作与快捷键", "⌘", "#dfac62")]),
+            ("plugins", "插件设置", [("plugin:" + key, CATALOG[key].title + (" · 已停用" if key in self.prefs.disabled else ""), CATALOG[key].symbol, CATALOG[key].color)
+                                       for key in self.prefs.sidebar_order if key in self.prefs.installed]),
+        ]
+        for group_id, title, entries in groups:
+            parent = QTreeWidgetItem([("▸  " if group_id in self.prefs.collapsed else "▾  ") + title])
+            parent.setData(0, Qt.ItemDataRole.UserRole + 2, title)
+            parent.setData(0, Qt.ItemDataRole.UserRole + 1, group_id)
+            parent.setFlags(parent.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            parent.setForeground(0, QColor("#99999f"))
+            self.tree.addTopLevelItem(parent)
+            for key, title, symbol, color in entries:
+                item = QTreeWidgetItem([title])
+                item.setIcon(0, icon(symbol, color))
+                item.setData(0, Qt.ItemDataRole.UserRole, key)
+                parent.addChild(item)
+                self.nav_items[key] = item
+                if key == self.destination:
+                    self.tree.setCurrentItem(item)
+            parent.setExpanded(group_id not in self.prefs.collapsed)
+        self.tree.blockSignals(False)
+        self.filter_sidebar(self.nav_search.text())
+        self.sidebar_status.setText(f"{len(self.prefs.installed)} 个已添加 · {len(self.host.active_ids)} 个已启用")
+
+    def filter_sidebar(self, query):
+        query = query.strip().casefold()
+        self.tree.blockSignals(True)
+        for index in range(self.tree.topLevelItemCount()):
+            group = self.tree.topLevelItem(index)
+            visible = False
+            for i in range(group.childCount()):
+                item = group.child(i)
+                match = query in item.text(0).casefold()
+                item.setHidden(not match)
+                visible |= match
+            group.setHidden(not visible and bool(query))
+            group_id = group.data(0, Qt.ItemDataRole.UserRole + 1)
+            group.setExpanded(True if query else group_id not in self.prefs.collapsed)
+        self.tree.blockSignals(False)
+
+    def remember_groups(self, *_):
+        if self.nav_search.text():
+            return
+        self.prefs.collapsed = {self.tree.topLevelItem(i).data(0, Qt.ItemDataRole.UserRole + 1)
+                                for i in range(self.tree.topLevelItemCount()) if not self.tree.topLevelItem(i).isExpanded()}
+        for i in range(self.tree.topLevelItemCount()):
+            group = self.tree.topLevelItem(i)
+            group.setText(0, ("▾  " if group.isExpanded() else "▸  ") + group.data(0, Qt.ItemDataRole.UserRole + 2))
+        self.save_preferences()
+
+    def sidebar_clicked(self, item, column):
+        if item.data(0, Qt.ItemDataRole.UserRole + 1):
+            item.setExpanded(not item.isExpanded())
+
+    def sidebar_selected(self, item, previous):
+        if item:
+            key = item.data(0, Qt.ItemDataRole.UserRole)
+            if key:
+                self.navigate(key)
+
+    def sidebar_menu(self, position):
+        item = self.tree.itemAt(position)
+        key = item.data(0, Qt.ItemDataRole.UserRole) if item else None
+        if not key or not key.startswith("plugin:"):
+            return
+        plugin_id = key[7:]
+        menu = QMenu(self)
+        menu.addAction("上移", lambda: self.move_sidebar(plugin_id, -1))
+        menu.addAction("下移", lambda: self.move_sidebar(plugin_id, 1))
+        menu.exec(self.tree.viewport().mapToGlobal(position))
+
+    def move_sidebar(self, key, direction):
+        visible = [p for p in self.prefs.sidebar_order if p in self.prefs.installed]
+        index = visible.index(key)
+        target = index + direction
+        if 0 <= target < len(visible):
+            other = visible[target]
+            order = self.prefs.sidebar_order
+            a, b = order.index(key), order.index(other)
+            order[a], order[b] = order[b], order[a]
+            self.host.persist()
+
+    def navigate(self, destination):
+        self.destination = destination
+        item = self.nav_items.get(destination)
+        if item:
+            self.tree.blockSignals(True)
+            self.tree.setCurrentItem(item)
+            item.parent().setExpanded(True)
+            self.tree.blockSignals(False)
+        self.render()
+
+    def page(self, title, description):
+        old = self.scroll.takeWidget()
+        if old:
+            old.hide()
+            old.deleteLater()
         widget = QWidget()
+        widget.setObjectName("content")
         layout = QVBoxLayout(widget)
-        layout.setContentsMargins(32, 28, 32, 24)
+        layout.setContentsMargins(30, 28, 30, 26)
         layout.setSpacing(18)
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         layout.addWidget(label(title, "title"))
         layout.addWidget(label(description, "muted"))
-        self.pages[key] = widget
-        self.stack.addWidget(widget)
+        self.scroll.setWidget(widget)
         return layout
 
-    def build_dashboard(self):
-        layout = self.page("system", "系统概览", f"{platform.node()}  /  Windows {platform.release()}  ·  实时设备状态")
-        grid = QGridLayout()
-        grid.setSpacing(18)
-        self.metrics = {}
-        for index, (key, title) in enumerate((("cpu", "CPU 使用率"), ("memory", "内存使用率"), ("disk", "系统盘使用率"), ("network", "网络下载速率"))):
-            card = QFrame()
-            card.setObjectName("card")
-            box = QVBoxLayout(card)
-            box.setContentsMargins(22, 22, 22, 22)
-            box.setSpacing(16)
-            box.addWidget(label(title, "muted"))
-            value, detail = label("—", "metric"), label("正在获取数据…", "muted")
-            bar = QProgressBar()
-            bar.setTextVisible(False)
-            box.addWidget(value)
-            box.addWidget(bar)
-            box.addWidget(detail)
-            if key == "network":
-                bar.hide()
-            grid.addWidget(card, index // 2, index % 2)
-            self.metrics[key] = (value, detail, bar)
-        layout.addLayout(grid)
-        self.device_info = label("正在读取运行时间…", "muted")
-        layout.addWidget(self.device_info)
-        layout.addStretch()
-        layout.addWidget(label("工作更专注，常用工具触手可及。", "muted"))
+    def render(self):
+        if self.destination.startswith("plugin:"):
+            self.render_plugin(self.destination[7:])
+        else:
+            getattr(self, "render_" + self.destination)()
 
-    def table(self, columns):
-        table = QTableWidget(0, len(columns))
-        table.setHorizontalHeaderLabels(columns)
-        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        table.verticalHeader().hide()
-        table.setAlternatingRowColors(True)
-        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        return table
+    def render_marketplace(self):
+        box = self.page("插件库", "按需添加工具，在插件设置中配置，再将组件放入你的面板。")
+        summary = QHBoxLayout()
+        summary.addWidget(label(f"内置目录  {len(PLUGINS)}", "badge"))
+        summary.addWidget(label("所有插件随应用提供，无需下载", "muted"), 1)
+        box.addLayout(summary)
+        self.market_search = QLineEdit()
+        self.market_search.setPlaceholderText("搜索插件名称或简介")
+        self.market_search.setText(self.market_query)
+        self.market_search.textChanged.connect(self.filter_market)
+        box.addWidget(self.market_search)
+        filters = QHBoxLayout()
+        self.category_buttons = {}
+        for category in ("全部", "系统", "效率", "监控"):
+            count = len(PLUGINS) if category == "全部" else sum(p.category == category for p in PLUGINS)
+            item = button(f"{category}  {count}", lambda c=category: self.choose_category(c))
+            item.setCheckable(True)
+            item.setChecked(category == self.market_category)
+            self.category_buttons[category] = item
+            filters.addWidget(item)
+        filters.addStretch()
+        state = QComboBox()
+        state.addItems(["全部状态", "已添加", "未添加", "已停用"])
+        state.setCurrentText(self.market_state)
+        state.currentTextChanged.connect(self.choose_market_state)
+        filters.addWidget(state)
+        box.addLayout(filters)
+        self.market_rows = {}
+        for manifest in sorted(PLUGINS, key=lambda p: p.id not in self.prefs.installed):
+            frame, layout = card()
+            row = plugin_heading(manifest)
+            installed = manifest.id in self.prefs.installed
+            if installed:
+                row.addWidget(label("已启用" if manifest.id in self.host.active_ids else "已停用", "muted"))
+                row.addWidget(button("设置", lambda k=manifest.id: self.navigate("plugin:" + k)))
+            else:
+                row.addWidget(button("添加", lambda k=manifest.id: self.attempt(lambda: self.host.install(k)), True))
+            row.addWidget(button("详情", lambda k=manifest.id: self.plugin_details(k)))
+            layout.addLayout(row)
+            layout.addWidget(label(manifest.description, "muted"))
+            box.addWidget(frame)
+            self.market_rows[manifest.id] = frame
+        self.market_empty = label("没有匹配的插件，请调整搜索词或分类。", "muted")
+        box.addWidget(self.market_empty)
+        box.addStretch()
+        self.filter_market(self.market_query)
 
-    def build_processes(self):
-        layout = self.page("processes", "进程查看", "按内存占用排序。系统保护进程可能无法读取。")
-        self.process_filter = QLineEdit()
-        self.process_filter.setPlaceholderText("搜索进程名称或 PID…")
-        self.process_filter.textChanged.connect(self.render_processes)
-        layout.addWidget(self.process_filter)
-        self.process_table = self.table(["进程名称", "PID", "内存占用"])
-        layout.addWidget(self.process_table)
-        button = QPushButton("在任务管理器中管理进程 ↗")
-        button.clicked.connect(lambda: self.run_action("taskmgr"))
-        layout.addWidget(button)
+    def choose_category(self, category):
+        self.market_category = category
+        for key, widget in self.category_buttons.items():
+            widget.setChecked(key == category)
+        self.filter_market(self.market_query)
 
-    def build_network(self):
-        layout = self.page("network", "网络信息", "本机网卡地址与链路状态；链路速率不代表互联网测速。")
-        self.network_table = self.table(["网卡", "状态", "IP 地址", "链路 Mbps"])
-        layout.addWidget(self.network_table)
+    def choose_market_state(self, state):
+        self.market_state = state
+        self.filter_market(self.market_query)
 
-    def build_awake(self):
-        layout = self.page("awake", "防止休眠", "适合下载、演示和长时间任务。退出 WinTools 后恢复系统休眠策略。")
-        self.awake_check = QCheckBox("保持系统唤醒")
-        self.display_check = QCheckBox("同时保持屏幕常亮")
-        self.display_check.setEnabled(False)
-        self.awake_check.toggled.connect(self.change_awake)
-        self.display_check.toggled.connect(self.change_awake)
-        layout.addWidget(self.awake_check)
-        layout.addWidget(self.display_check)
-        self.awake_status = label("当前使用 Windows 默认休眠策略", "muted")
-        layout.addWidget(self.awake_status)
-        layout.addWidget(label("不会阻止手动睡眠、关机或合盖策略；不修改电源计划。", "muted"))
-        layout.addStretch()
+    def filter_market(self, query):
+        self.market_query = query
+        count = 0
+        for manifest in PLUGINS:
+            match = query.casefold() in (manifest.title + manifest.description).casefold()
+            match &= self.market_category in ("全部", manifest.category)
+            if self.market_state == "已添加":
+                match &= manifest.id in self.prefs.installed
+            elif self.market_state == "未添加":
+                match &= manifest.id not in self.prefs.installed
+            elif self.market_state == "已停用":
+                match &= manifest.id in self.prefs.disabled
+            self.market_rows[manifest.id].setVisible(match)
+            count += int(match)
+        self.market_empty.setVisible(count == 0)
 
-    def build_actions(self):
-        layout = self.page("shortcuts", "快捷操作", "直达 Windows 系统设置，常用操作集中管理。")
-        grid = QGridLayout()
-        for index, (key, title, description) in enumerate(ACTIONS):
-            button = QPushButton(f"{title}  ↗\n{description}")
-            button.setMinimumHeight(76)
-            button.clicked.connect(lambda checked=False, k=key: self.run_action(k))
-            grid.addWidget(button, index // 2, index % 2)
-        layout.addLayout(grid)
-        layout.addStretch()
+    def plugin_details(self, key):
+        manifest = CATALOG[key]
+        dialog = QDialog(self)
+        dialog.setWindowTitle(manifest.title)
+        dialog.resize(500, 310)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(18)
+        layout.addLayout(plugin_heading(manifest))
+        layout.addWidget(label(manifest.description))
+        layout.addWidget(label("权限与数据\n" + manifest.permission, "muted"))
+        layout.addWidget(label("来源：WinTools 内置插件 · 与应用一起更新", "muted"))
+        def open_plugin():
+            dialog.accept()
+            if key not in self.host.instances:
+                self.attempt(lambda: self.host.install(key))
+            if key in self.host.instances:
+                self.navigate("plugin:" + key)
+        layout.addWidget(button("打开设置" if key in self.host.instances else "添加插件", open_plugin, True))
+        dialog.exec()
+        dialog.deleteLater()
 
-    def build_plugins(self):
-        layout = self.page("plugins", "插件管理", "第一版提供 5 个内置模块。关闭模块会停止其数据采样或释放其状态。")
-        self.plugin_checks = {}
-        for plugin in PLUGINS:
-            card = QFrame()
-            card.setObjectName("card")
-            row = QHBoxLayout(card)
-            text = QVBoxLayout()
-            text.addWidget(label(f"{plugin.title}  /  {plugin.category}"))
-            text.addWidget(label(plugin.description, "muted"))
-            row.addLayout(text, 1)
-            check = QCheckBox("启用")
-            check.setChecked(plugin.id not in self.prefs.disabled)
-            check.toggled.connect(lambda checked, key=plugin.id: self.toggle_plugin(key, checked))
-            self.plugin_checks[plugin.id] = check
-            row.addWidget(check)
-            layout.addWidget(card)
-        layout.addStretch()
+    def render_plugin(self, key):
+        plugin = self.host.instances[key]
+        manifest = plugin.manifest
+        box = self.page(manifest.title, manifest.description)
+        frame, layout = card()
+        row = plugin_heading(manifest)
+        toggle = Toggle("启用")
+        toggle.setChecked(plugin.active)
+        toggle.toggled.connect(lambda checked: self.set_plugin_enabled(key, checked))
+        row.addWidget(toggle)
+        row.addWidget(button("移除", lambda: self.uninstall(key)))
+        layout.addLayout(row)
+        layout.addWidget(label(manifest.permission, "muted"))
+        box.addWidget(frame)
+        if plugin.active:
+            control, content = card()
+            content.addWidget(label("功能与设置", "section"))
+            content.addWidget(plugin.create_view())
+            box.addWidget(control)
+            add = QHBoxLayout()
+            add.addWidget(label("添加到面板", "muted"))
+            target = QComboBox()
+            for panel in self.prefs.panels:
+                target.addItem(panel["title"], panel["id"])
+            add.addWidget(target, 1)
+            add.addWidget(button("添加组件", lambda: self.attempt(lambda: self.host.add_item(target.currentData(), key))))
+            box.addLayout(add)
+        else:
+            box.addWidget(label("插件已停用。相关操作与组件暂停，重新启用后恢复。", "muted"))
+        box.addStretch()
 
-    def build_settings(self):
-        layout = self.page("settings", "偏好设置", "配置保存在当前 Windows 用户的本地应用数据目录。")
-        check = QCheckBox("关闭窗口时最小化到系统托盘")
+    def uninstall(self, key):
+        if self.services.confirm("移除插件", f"移除“{CATALOG[key].title}”？它会从侧栏和所有面板移除，可随时从插件库重新添加。"):
+            self.attempt(lambda: self.host.uninstall(key))
+
+    def set_plugin_enabled(self, key, enabled):
+        try:
+            self.host.set_enabled(key, enabled)
+        except (OSError, ValueError) as exc:
+            self.services.error(str(exc))
+            self.render()
+
+    def render_panels(self):
+        box = self.page("我的面板", "把实时组件、功能行和操作网格组合在一起。面板布局会自动保存。")
+        row = QHBoxLayout()
+        self.panel_picker = QComboBox()
+        for panel in self.prefs.panels:
+            self.panel_picker.addItem(panel["title"], panel["id"])
+        self.panel_picker.setCurrentIndex(self.panel_picker.findData(self.selected_panel))
+        self.panel_picker.currentIndexChanged.connect(self.select_panel)
+        row.addWidget(self.panel_picker, 1)
+        row.addWidget(button("新建", self.new_panel))
+        row.addWidget(button("重命名", self.rename_panel))
+        row.addWidget(button("删除", self.delete_panel))
+        box.addLayout(row)
+        toolbar = QHBoxLayout()
+        panel = self.host.panel(self.selected_panel)
+        toolbar.addWidget(label(f"{len(panel['items'])} 个组件", "muted"))
+        toolbar.addStretch()
+        toolbar.addWidget(button("调整顺序", self.edit_order))
+        toolbar.addWidget(button("＋ 添加组件", self.component_library, True))
+        box.addLayout(toolbar)
+        columns = QHBoxLayout()
+        left, right = QVBoxLayout(), QVBoxLayout()
+        columns.addLayout(left, 1)
+        columns.addLayout(right, 1)
+        columns.setSpacing(16)
+        for index, key in enumerate(panel["items"]):
+            plugin = self.host.instances.get(key)
+            if not plugin:
+                continue
+            frame, layout = card()
+            header = plugin_heading(plugin.manifest, False)
+            header.addWidget(button("设置", lambda k=key: self.navigate("plugin:" + k)))
+            remove = button("×", lambda k=key: self.host.remove_item(self.selected_panel, k))
+            remove.setToolTip("从此面板移除组件")
+            header.addWidget(remove)
+            layout.addLayout(header)
+            if plugin.active:
+                layout.addWidget(plugin.create_view(compact=True))
+            else:
+                layout.addWidget(label("插件已停用", "muted"))
+                layout.addWidget(button("启用插件", lambda k=key: self.attempt(lambda: self.host.set_enabled(k, True))))
+            (left if index % 2 == 0 else right).addWidget(frame)
+        left.addStretch()
+        right.addStretch()
+        box.addLayout(columns)
+        if not panel["items"]:
+            box.addWidget(label("这个面板还没有组件。点击“添加组件”选择你的工具。", "muted"))
+        box.addStretch()
+
+    def select_panel(self, index):
+        self.selected_panel = self.panel_picker.itemData(index)
+        self.render()
+
+    def new_panel(self):
+        name, ok = QInputDialog.getText(self, "新建面板", "面板名称")
+        if ok and name.strip():
+            key = self.attempt(lambda: self.host.add_panel(name))
+            if key:
+                self.selected_panel = key
+                self.render()
+
+    def rename_panel(self):
+        panel = self.host.panel(self.selected_panel)
+        name, ok = QInputDialog.getText(self, "重命名面板", "面板名称", text=panel["title"])
+        if ok and name.strip():
+            panel["title"] = name.strip()[:40]
+            self.host.persist()
+
+    def delete_panel(self):
+        if len(self.prefs.panels) == 1:
+            self.services.notify("至少保留一个面板")
+            return
+        if self.services.confirm("删除面板", "删除此面板布局？已添加的插件会保留。"):
+            self.prefs.panels = [p for p in self.prefs.panels if p["id"] != self.selected_panel]
+            self.host.persist()
+
+    def edit_order(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("调整组件顺序")
+        dialog.resize(420, 420)
+        box = QVBoxLayout(dialog)
+        box.addWidget(label("拖动排序，或使用下方按钮。面板按从左到右排列。", "muted"))
+        items = QListWidget()
+        items.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        for key in self.host.panel(self.selected_panel)["items"]:
+            item = QListWidgetItem(CATALOG[key].title)
+            item.setData(Qt.ItemDataRole.UserRole, key)
+            items.addItem(item)
+        box.addWidget(items)
+        def move(offset):
+            index = items.currentRow()
+            if 0 <= index + offset < items.count() and index >= 0:
+                item = items.takeItem(index)
+                items.insertItem(index + offset, item)
+                items.setCurrentRow(index + offset)
+        controls = QHBoxLayout()
+        controls.addWidget(button("上移", lambda: move(-1)))
+        controls.addWidget(button("下移", lambda: move(1)))
+        controls.addWidget(button("保存顺序", dialog.accept, True))
+        box.addLayout(controls)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.host.set_panel_order(self.selected_panel, [items.item(i).data(Qt.ItemDataRole.UserRole) for i in range(items.count())])
+        dialog.deleteLater()
+
+    def component_library(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("组件库")
+        dialog.resize(880, 650)
+        root = QHBoxLayout(dialog)
+        sidebar = QVBoxLayout()
+        search = QLineEdit()
+        search.setPlaceholderText("搜索组件")
+        items = QListWidget()
+        items.setFixedWidth(220)
+        sidebar.addWidget(search)
+        sidebar.addWidget(items)
+        root.addLayout(sidebar)
+        preview = QVBoxLayout()
+        root.addLayout(preview, 1)
+        def show_preview():
+            clear_layout(preview)
+            item = items.currentItem()
+            if not item:
+                preview.addWidget(label("没有可用组件，请先在插件库添加并启用插件。", "muted"))
+                return
+            key = item.data(Qt.ItemDataRole.UserRole)
+            plugin = self.host.instances[key]
+            preview.addWidget(label(plugin.manifest.title, "title"))
+            preview.addWidget(label(plugin.manifest.description, "muted"))
+            frame, content = card()
+            view = plugin.create_view(compact=True)
+            view.setEnabled(False)
+            content.addWidget(view)
+            preview.addWidget(frame)
+            preview.addStretch()
+            existing = key in self.host.panel(self.selected_panel)["items"]
+            def add():
+                self.host.add_item(self.selected_panel, key)
+                dialog.accept()
+            add_button = button("已添加到此面板" if existing else "添加到“" + self.host.panel(self.selected_panel)["title"] + "”", add, True)
+            add_button.setEnabled(not existing)
+            preview.addWidget(add_button)
+        def filter_items(query):
+            items.blockSignals(True)
+            items.clear()
+            for key in self.prefs.sidebar_order:
+                if key in self.host.active_ids and query.casefold() in CATALOG[key].title.casefold():
+                    item = QListWidgetItem(icon(CATALOG[key].symbol, CATALOG[key].color), CATALOG[key].title)
+                    item.setData(Qt.ItemDataRole.UserRole, key)
+                    items.addItem(item)
+            items.setCurrentRow(0)
+            items.blockSignals(False)
+            show_preview()
+        search.textChanged.connect(filter_items)
+        items.currentItemChanged.connect(lambda *_: show_preview())
+        filter_items("")
+        dialog.exec()
+        dialog.deleteLater()
+
+    def render_actions(self):
+        box = self.page("操作与快捷键", "操作由已启用插件提供。Ctrl+K 在应用内打开统一搜索。")
+        search = QLineEdit()
+        search.setPlaceholderText("搜索操作或插件")
+        box.addWidget(search)
+        rows = []
+        for key, manifest, action in self.host.actions():
+            frame, layout = card()
+            row = QHBoxLayout()
+            row.addWidget(label(action.title), 1)
+            row.addWidget(label(manifest.title, "muted"))
+            row.addWidget(button("执行", lambda k=key: self.services.run(k)))
+            layout.addLayout(row)
+            box.addWidget(frame)
+            rows.append((action.title + manifest.title, frame))
+        search.textChanged.connect(lambda query: [frame.setVisible(query.casefold() in title.casefold()) for title, frame in rows])
+        box.addWidget(label("当前快捷键仅在 WinTools 内生效。", "muted"))
+        box.addStretch()
+
+    def render_general(self):
+        box = self.page("通用", "设置常驻行为与导航。工具功能由插件提供。")
+        frame, content = card()
+        content.addWidget(label("窗口与托盘", "section"))
+        check = Toggle("关闭窗口时保留在系统托盘")
         check.setChecked(self.prefs.close_to_tray)
-        check.toggled.connect(self.change_close_behavior)
-        layout.addWidget(check)
-        layout.addWidget(label("托盘不可用时，关闭窗口会正常退出。通过托盘菜单可完全退出。", "muted"))
-        layout.addWidget(label(str(self.prefs.path), "muted"))
-        layout.addSpacing(20)
-        layout.addWidget(label("关于 WinTools"))
-        layout.addWidget(label("Python + Qt · 参考 MacTools 的模块化工具箱设计\n当前为 0.1 首版，不包含在线插件市场与自动更新。", "muted"))
-        layout.addStretch()
+        check.toggled.connect(self.set_close_behavior)
+        content.addWidget(check)
+        content.addWidget(label("托盘菜单可打开面板、执行插件操作或完全退出。", "muted"))
+        box.addWidget(frame)
+        frame, content = card()
+        content.addWidget(label("侧栏与面板", "section"))
+        content.addWidget(label("点击分组标题旁的箭头折叠分组。右键插件可上移或下移，顺序自动保存。", "muted"))
+        content.addWidget(button("编辑我的面板", lambda: self.navigate("panels")))
+        box.addWidget(frame)
+        box.addWidget(label("配置文件\n" + str(self.prefs.path), "muted"))
+        box.addStretch()
 
-    def change_close_behavior(self, checked):
-        self.prefs.close_to_tray = checked
+    def set_close_behavior(self, value):
+        self.prefs.close_to_tray = value
         self.save_preferences()
 
     def save_preferences(self):
         try:
             self.prefs.save()
         except OSError as exc:
-            QMessageBox.warning(self, "配置未保存", f"本次设置已生效，但无法保存：{exc}")
+            self.services.error("配置保存失败：" + str(exc))
 
-    def toggle_plugin(self, key, checked):
-        if not checked and key == "awake":
-            try:
-                self.system.release()
-            except OSError as exc:
-                self.plugin_checks[key].blockSignals(True)
-                self.plugin_checks[key].setChecked(True)
-                self.plugin_checks[key].blockSignals(False)
-                QMessageBox.warning(self, "无法停用", str(exc))
-                return
-            self.awake_check.setChecked(False)
-        if checked:
-            self.prefs.disabled.discard(key)
-        else:
-            self.prefs.disabled.add(key)
-        self.apply_plugins()
-        self.save_preferences()
+    def render_permissions(self):
+        box = self.page("权限与隐私", "查看已添加插件的数据访问方式。")
+        for key in self.prefs.sidebar_order:
+            if key not in self.prefs.installed:
+                continue
+            manifest = CATALOG[key]
+            frame, content = card()
+            content.addLayout(plugin_heading(manifest, False))
+            content.addWidget(label(manifest.permission, "muted"))
+            box.addWidget(frame)
+        box.addStretch()
 
-    def apply_plugins(self):
-        self.monitor.enabled = frozenset(p.id for p in PLUGINS if p.id not in self.prefs.disabled)
-        for plugin in PLUGINS:
-            self.nav_buttons[plugin.id].setEnabled(plugin.id not in self.prefs.disabled)
-
-    def navigate(self, key):
-        if key in self.prefs.disabled:
-            return
-        self.stack.setCurrentWidget(self.pages[key])
-        for name, button in self.nav_buttons.items():
-            button.setChecked(name == key)
-
-    def change_awake(self, *_):
-        try:
-            self.system.keep_awake(self.awake_check.isChecked(), self.display_check.isChecked())
-        except OSError as exc:
-            self.awake_check.blockSignals(True)
-            self.display_check.blockSignals(True)
-            self.awake_check.setChecked(self.system.awake)
-            self.display_check.setChecked(self.system.display)
-            self.awake_check.blockSignals(False)
-            self.display_check.blockSignals(False)
-            QMessageBox.warning(self, "操作失败", str(exc))
-        self.display_check.setEnabled(self.system.awake)
-        self.awake_status.setText("防休眠已启用" if self.system.awake else "当前使用 Windows 默认休眠策略")
-
-    def run_action(self, key):
-        if key == "lock" and QMessageBox.question(self, "锁定电脑", "现在锁定 Windows？") != QMessageBox.StandardButton.Yes:
-            return
-        try:
-            self.system.open_action(key)
-            self.statusBar().showMessage("操作已发送给 Windows", 5000)
-        except (OSError, ValueError) as exc:
-            QMessageBox.warning(self, "操作失败", str(exc))
+    def render_about(self):
+        box = self.page("关于 WinTools", "把常用 Windows 工具放到同一个地方。")
+        frame, content = card()
+        content.addWidget(label("WinTools 0.2", "brand"))
+        content.addWidget(label("借鉴 MacTools 的分组侧栏、插件宿主、组件库和面板组合方式，使用 Python 与 Qt 实现 Windows 功能。"))
+        content.addWidget(label("当前提供 8 个内置插件。插件库是本地目录，暂不支持在线市场、外部插件包、工作流和全局快捷键。", "muted"))
+        box.addWidget(frame)
+        box.addStretch()
 
     def command_palette(self):
         dialog = QDialog(self)
-        dialog.setWindowTitle("搜索操作 · Ctrl+K")
-        dialog.resize(560, 430)
-        layout = QVBoxLayout(dialog)
-        field = QLineEdit()
-        field.setPlaceholderText("搜索功能、Windows 设置…")
+        dialog.setWindowTitle("搜索操作")
+        dialog.resize(580, 450)
+        box = QVBoxLayout(dialog)
+        search = QLineEdit()
+        search.setPlaceholderText("搜索操作、插件或页面…")
         results = QListWidget()
-        layout.addWidget(field)
-        layout.addWidget(results)
-        entries = [(title, lambda k=key: self.run_action(k)) for key, title, _ in ACTIONS] if "shortcuts" not in self.prefs.disabled else []
-        entries += [(p.title, lambda k=p.id: self.navigate(k)) for p in PLUGINS if p.id not in self.prefs.disabled]
-        entries += [("插件管理", lambda: self.navigate("plugins")), ("偏好设置", lambda: self.navigate("settings"))]
+        box.addWidget(search)
+        box.addWidget(results)
+        entries = [(action.title + "  ·  " + manifest.title, lambda k=key: self.services.run(k)) for key, manifest, action in self.host.actions()]
+        entries += [(manifest.title + "  ·  插件设置", lambda k=key: self.navigate("plugin:" + k))
+                    for key, manifest in CATALOG.items() if key in self.host.instances]
+        entries += [(title, lambda k=key: self.navigate(k)) for key, title in [("panels", "我的面板"), ("marketplace", "插件库"), ("general", "通用")]]
         filtered = []
-
         def refresh(query):
             filtered[:] = [(title, callback) for title, callback in entries if query.casefold() in title.casefold()]
             results.clear()
             results.addItems([title for title, _ in filtered])
-            if filtered:
-                results.setCurrentRow(0)
-
+            results.setCurrentRow(0)
         def execute(*_):
             index = results.currentRow()
             if index >= 0:
+                callback = filtered[index][1]
                 dialog.accept()
-                filtered[index][1]()
-
-        field.textChanged.connect(refresh)
-        field.returnPressed.connect(execute)
+                # Close the search dialog before screenshot actions hide the host.
+                QTimer.singleShot(0, callback)
+        search.textChanged.connect(refresh)
+        search.returnPressed.connect(execute)
         results.itemActivated.connect(execute)
         refresh("")
-        field.setFocus()
+        search.setFocus()
         dialog.exec()
+        dialog.deleteLater()
 
-    def fill_table(self, table, rows):
-        scroll = table.verticalScrollBar().value()
-        table.setRowCount(len(rows))
-        for i, row in enumerate(rows):
-            for j, value in enumerate(row):
-                item = QTableWidgetItem(str(value))
-                item.setToolTip(str(value))
-                table.setItem(i, j, item)
-        table.verticalScrollBar().setValue(scroll)
+    def build_tray(self):
+        self.tray_menu.clear()
+        self.tray_menu.addAction("打开 WinTools", self.show_window)
+        panels = self.tray_menu.addMenu("我的面板")
+        for panel in self.prefs.panels:
+            panels.addAction(panel["title"], lambda k=panel["id"]: self.show_panel(k))
+        actions = self.tray_menu.addMenu("插件操作")
+        for key, manifest, action in self.host.actions():
+            actions.addAction(manifest.title + " · " + action.title, lambda k=key: self.services.run(k))
+        self.tray_menu.addSeparator()
+        self.tray_menu.addAction("退出", self.quit_app)
 
-    def render_processes(self, *_):
-        query = self.process_filter.text().casefold()
-        rows = [(name, pid, format_bytes(memory)) for pid, name, memory in self.processes
-                if query in name.casefold() or query in str(pid)]
-        self.fill_table(self.process_table, rows)
+    def show_panel(self, key):
+        self.selected_panel = key
+        self.navigate("panels")
+        self.show_window()
 
     def update_snapshot(self, data):
         self.has_snapshot = True
-        if "system" in data and "system" not in self.prefs.disabled:
-            info = data["system"]
-            for key in ("cpu", "memory", "disk"):
-                value, detail, bar = self.metrics[key]
-                value.setText(f"{info[key]:.1f}%")
-                bar.setValue(round(info[key]))
-            self.metrics["cpu"][1].setText(f"{os.cpu_count()} 个逻辑处理器")
-            self.metrics["memory"][1].setText(f"{format_bytes(info['memory_used'])} / {format_bytes(info['memory_total'])}")
-            self.metrics["disk"][1].setText(f"剩余 {format_bytes(info['disk_free'])}")
-            self.metrics["network"][0].setText(f"{format_bytes(info['down'])}/s")
-            self.metrics["network"][1].setText(f"上传 {format_bytes(info['up'])}/s · 所有网卡合计")
-            hours = int(info["uptime"] // 3600)
-            battery = "无电池 / 台式设备" if info["battery"] is None else f"电池 {info['battery']:.0f}%"
-            self.device_info.setText(f"已运行 {hours // 24} 天 {hours % 24} 小时  ·  {battery}")
-        if "processes" in data and "processes" not in self.prefs.disabled:
-            self.processes = data["processes"]
-            self.render_processes()
-        if "network" in data and "network" not in self.prefs.disabled:
-            self.fill_table(self.network_table, data["network"])
+        self.host.update(data)
 
     def tray_activated(self, reason):
         if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
@@ -431,17 +678,19 @@ class Window(QMainWindow):
         if not self.exiting and self.prefs.close_to_tray and self.tray.isVisible():
             self.hide()
             event.ignore()
-        else:
-            self.shutdown()
-            event.accept()
+            return
+        self.shutdown()
+        event.accept()
 
     def shutdown(self):
+        if self.closed:
+            return
+        self.closed = True
         self.monitor.requestInterruption()
         self.monitor.wait()
-        try:
-            self.system.release()
-        finally:
-            self.tray.hide()
+        for message in self.host.shutdown():
+            print(message, file=sys.stderr)
+        self.tray.hide()
 
     def quit_app(self):
         self.exiting = True
@@ -449,9 +698,9 @@ class Window(QMainWindow):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="WinTools Windows utility dashboard")
-    parser.add_argument("--smoke-test", action="store_true", help="Collect data, render panels and exit")
-    parser.add_argument("--screenshot", type=Path, help="Screenshot output for smoke test")
+    parser = argparse.ArgumentParser(description="WinTools plugin host")
+    parser.add_argument("--smoke-test", action="store_true")
+    parser.add_argument("--screenshot", type=Path)
     args = parser.parse_args()
     if sys.platform != "win32":
         parser.error("WinTools currently supports Windows only")
@@ -459,33 +708,60 @@ def main():
     app.setApplicationName("WinTools")
     app.setOrganizationName("WinTools")
     app.setStyle("Fusion")
+    app.setPalette(dark_palette())
     app.setStyleSheet(STYLE)
-    config = Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppLocalDataLocation)) / "settings.json"
-    if args.smoke_test:
-        config = Path("artifacts/smoke-settings.json")
-    window = Window(Preferences(config), smoke=args.smoke_test)
+    temp = TemporaryDirectory() if args.smoke_test else None
+    path = Path(temp.name) / "settings.json" if temp else Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppLocalDataLocation)) / "settings.json"
+    window = Window(Preferences(path), smoke=args.smoke_test)
     window.show()
     outcome = [0]
     if args.smoke_test:
         def finish():
             try:
-                assert window.has_snapshot, "No monitoring snapshot received"
-                assert window.process_table.rowCount() > 0, "Process list is empty"
-                assert window.network_table.rowCount() > 0, "Network list is empty"
-                for key in window.pages:
+                assert window.has_snapshot
+                assert window.host.instances["processes"].snapshot
+                assert window.host.instances["network"].snapshot
+                for key in ("general", "permissions", "about", "actions", "panels"):
                     window.navigate(key)
                     app.processEvents()
-                window.navigate("system")
+                for key in list(window.host.instances):
+                    window.navigate("plugin:" + key)
+                    app.processEvents()
+                window.host.install("clipboard")
+                window.navigate("plugin:clipboard")
                 app.processEvents()
+                window.host.set_enabled("clipboard", False)
+                assert "clipboard:clear" not in [entry[0] for entry in window.host.actions()]
+                window.host.uninstall("clipboard")
+                assert "plugin:clipboard" not in window.nav_items
                 if args.screenshot:
                     args.screenshot.parent.mkdir(parents=True, exist_ok=True)
-                    assert window.grab().save(str(args.screenshot)), "Screenshot save failed"
-                print("PASS: live metrics, processes, network and all seven panels")
+                    for destination, name in [("marketplace", args.screenshot.name), ("panels", "panels.png"), ("plugin:awake", "plugin-settings.png")]:
+                        window.navigate(destination)
+                        app.processEvents()
+                        assert window.grab().save(str(args.screenshot.parent / name))
+                    window.selected_panel = "controls"
+                    window.navigate("panels")
+                    app.processEvents()
+                    assert window.grab().save(str(args.screenshot.parent / "controls.png"))
+                    captures = []
+                    def capture_library():
+                        dialog = app.activeModalWidget()
+                        if dialog:
+                            captures.append(dialog.grab().save(str(args.screenshot.parent / "components.png")))
+                            dialog.reject()
+                    QTimer.singleShot(250, capture_library)
+                    window.component_library()
+                    assert captures == [True], "Component library screenshot failed"
+                print("PASS: live data, all plugin views, lifecycle, sidebar and panel rendering")
             except Exception as exc:
-                print(f"FAIL: {exc}", file=sys.stderr)
+                import traceback
+                traceback.print_exc()
                 outcome[0] = 1
             finally:
                 window.quit_app()
-        QTimer.singleShot(5000, finish)
+        QTimer.singleShot(4500, finish)
     result = app.exec()
+    if temp:
+        temp.cleanup()
     return outcome[0] or result
