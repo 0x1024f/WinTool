@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wintools-desktop"
+version = "0.1.0"
+description = "A local Windows utility dashboard inspired by MacTools"
+requires-python = ">=3.11"
+dependencies = ["PySide6>=6.8,<7", "psutil>=6,<8"]
+
+[project.gui-scripts]
+wintools = "wintools.app:main"
+
+[tool.setuptools.packages.find]
+include = ["wintools*"]
+
+[tool.uv]
+cache-dir = ".uv-cache"
